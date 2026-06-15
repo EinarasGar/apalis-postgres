@@ -1,6 +1,7 @@
 use apalis_core::{
     error::AbortError,
     error::BoxDynError,
+    error::RetryAfterError,
     layers::{Layer, Service},
     task::{Parts, status::Status},
     worker::{context::WorkerContext, ext::ack::Acknowledge},
@@ -36,18 +37,35 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         let response = serde_json::to_value(res.as_ref().map_err(|e| e.to_string()));
         let status = calculate_status(parts, res);
         let attempt = parts.attempt.current() as i32;
+        // When the handler returns a `RetryAfterError`, defer the next run by its
+        // duration so the failed task is not re-fetched immediately (durable backoff).
+        let retry_after_secs: Option<f64> = res
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<RetryAfterError>())
+            .map(|r| r.get_duration().as_secs_f64());
         let pool = self.pool.clone();
         async move {
-            let res = sqlx::query_file!(
-                "queries/task/ack.sql",
-                task_id
-                    .ok_or(sqlx::Error::ColumnNotFound("TASK_ID_FOR_ACK".to_owned()))?
-                    .to_string(),
-                attempt,
-                &response.map_err(|e| sqlx::Error::Decode(e.into()))?,
-                status.to_string(),
-                worker_id.ok_or(sqlx::Error::ColumnNotFound("WORKER_ID_LOCK_BY".to_owned()))?
+            let task_id = task_id
+                .ok_or(sqlx::Error::ColumnNotFound("TASK_ID_FOR_ACK".to_owned()))?
+                .to_string();
+            let worker_id =
+                worker_id.ok_or(sqlx::Error::ColumnNotFound("WORKER_ID_LOCK_BY".to_owned()))?;
+            let response = response.map_err(|e| sqlx::Error::Decode(e.into()))?;
+            let res = sqlx::query(
+                "UPDATE apalis.jobs \
+                 SET status = $4, attempts = $2, last_result = $3, done_at = NOW(), \
+                     run_at = CASE WHEN $6::double precision IS NOT NULL \
+                                   THEN NOW() + ($6 * INTERVAL '1 second') \
+                                   ELSE run_at END \
+                 WHERE id = $1 AND lock_by = $5",
             )
+            .bind(task_id)
+            .bind(attempt)
+            .bind(response)
+            .bind(status.to_string())
+            .bind(worker_id)
+            .bind(retry_after_secs)
             .execute(&pool)
             .await?;
 
@@ -66,11 +84,16 @@ pub fn calculate_status<Res>(
 ) -> Status {
     match &res {
         Ok(_) => Status::Done,
-        Err(e) => match &e {
-            // Error::Abort(_) => State::Killed,
-            _ if parts.ctx.max_attempts() as usize <= parts.attempt.current() => Status::Killed,
-            _ => Status::Failed,
-        },
+        Err(e) => {
+            if e.downcast_ref::<AbortError>().is_some() {
+                // Explicitly non-retryable: terminate immediately.
+                Status::Killed
+            } else if parts.ctx.max_attempts() as usize <= parts.attempt.current() {
+                Status::Killed
+            } else {
+                Status::Failed
+            }
+        }
     }
 }
 
